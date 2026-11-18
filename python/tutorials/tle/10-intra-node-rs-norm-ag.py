@@ -542,6 +542,14 @@ class RingComm:
         return dict(dist_ctx=self.ctx, USE_TLE=self.use_tle)
 
 
+def _num_warps(block: int) -> int:
+    # ROCm wavefronts are 64 lanes, twice a CUDA warp. On BW1101 (H=6144, 8 ranks) 4 waves per
+    # program is the fastest: 1393 us at 8192 tokens, against 1761 us with 16
+    if torch.version.hip:
+        return 4
+    return min(16, max(4, block // 256))
+
+
 class fused_rs_add_rms_norm_ag:
     """Launcher of ``rs_norm_ag_ring_kernel`` on a ``RingComm``.
 
@@ -625,7 +633,7 @@ class fused_rs_add_rms_norm_ag:
             H=H,
             BLOCK_H=BLOCK_H,
             DO_AG=gather,
-            num_warps=min(16, max(4, BLOCK_H // 256)),
+            num_warps=_num_warps(BLOCK_H),
             **comm.launch_args(),
         )
         return out
@@ -718,7 +726,7 @@ class fused_qkv_norm_ag:
             Q=self.q_dim,
             KV=self.kv_dim,
             BLOCK=BLOCK,
-            num_warps=min(16, max(4, BLOCK // 256)),
+            num_warps=_num_warps(BLOCK),
             **comm.launch_args(),
         )
         return out
