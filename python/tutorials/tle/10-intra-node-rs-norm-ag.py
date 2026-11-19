@@ -417,8 +417,37 @@ class _Platform:
     def num_warps(self, block):
         return min(16, max(4, block // 256))
 
+    def kernel(self, fn):
+        """The jit function to launch, wrapped if the platform needs compile settings."""
+        return fn
+
     def kernel_args(self):
         return dict(RECV_LOAD=self.recv_load, REMOTE_STORE=self.remote_store, SIGNAL=self.signal, WAIT=self.wait)
+
+
+class _EnvScopedKernel:
+    """kernel[grid](...) with one env var set while it launches (and compiles), restored after.
+    The env var, unlike triton.knobs, enters the disk cache key, so a binary built without
+    the setting is never reused."""
+
+    def __init__(self, fn, key, value):
+        self.fn, self.key, self.value = fn, key, value
+
+    def __getitem__(self, grid):
+        launch = self.fn[grid]
+
+        def run(*args, **kwargs):
+            old = os.environ.get(self.key)
+            os.environ[self.key] = self.value
+            try:
+                return launch(*args, **kwargs)
+            finally:
+                if old is None:
+                    del os.environ[self.key]
+                else:
+                    os.environ[self.key] = old
+
+        return run
 
 
 class PpuPlatform(_Platform):
@@ -442,6 +471,12 @@ class HcuPlatform(_Platform):
     def allocate(self, ptr, size):
         # hipDeviceMallocUncached: coarse-grained hipMalloc breaks peer flag visibility.
         return self.fn("ExtMallocWithFlags")(ptr, size, ctypes.c_uint(3))
+
+    def kernel(self, fn):
+        # Buffer ops break these kernels on the AMD backend: FlagTree fails to build them
+        # (HSACO: llvm.amdgcn.make.buffer.rsrc gets the wrong pointer type) and stock Triton
+        # 3.5 builds them 20% slower (1682 us vs 1392 us at 8192 tokens on BW1101).
+        return _EnvScopedKernel(fn, "AMDGCN_USE_BUFFER_OPS", "0")
 
 
 class MetaxPlatform(_Platform):
@@ -721,7 +756,7 @@ class fused_rs_add_rms_norm_ag:
         parity, base = comm.next_call(2 * W - 2 if gather else W - 1)
         nchan, grid = comm.launch_shape(T)
         BLOCK_H = triton.next_power_of_2(H)
-        rs_norm_ag_ring_kernel[(grid, )](
+        comm.platform.kernel(rs_norm_ag_ring_kernel)[(grid, )](
             x,
             residual if residual.numel() else x,
             weight,
@@ -812,7 +847,7 @@ class fused_qkv_norm_ag:
         parity, base = comm.next_call(W - 1)
         nchan, grid = comm.launch_shape(T)
         BLOCK = triton.next_power_of_2(D)
-        qkv_norm_ag_ring_kernel[(grid, )](
+        comm.platform.kernel(qkv_norm_ag_ring_kernel)[(grid, )](
             x if x.numel() else out,
             q_weight,
             kv_weight,
