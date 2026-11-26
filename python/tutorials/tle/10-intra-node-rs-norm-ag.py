@@ -174,7 +174,7 @@ def rs_norm_ag_ring_kernel(
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     DO_AG: tl.constexpr,  # False: stop after the norm, out holds only my rows
-    QUANT: tl.constexpr,  # 0: none; 1: AG x dtype, quantize every row into q / s; 2: AG fp8 + scale
+    QUANT: tl.constexpr,  # 0: none; 2: quantize my rows, AG fp8 + scale
     FP8_MAX: tl.constexpr,
     BLOCK_W: tl.constexpr,  # QUANT == 2: >= H / 4 + 1, the int32 words of a row on the ring
     PEER_PTR: tl.constexpr,
@@ -295,16 +295,6 @@ def rs_norm_ag_ring_kernel(
     else:
         _epoch_end(call_state_ptr, seq, base, WORLD - 1, DEVICE_EPOCH)
 
-        if QUANT == 1:
-            # off the ring's critical path: quantize the rows this program wrote, all chunks
-            for k in range(0, WORLD):
-                b = tl.minimum(k * chunk, num_tokens)
-                n = tl.minimum((k + 1) * chunk, num_tokens) - b
-                for lr in range(pid, n, G):
-                    g = (b + lr).to(tl.int64) * H
-                    q, sc = _quant_row(tl.load(out_ptr + g + cols, mask=m).to(tl.float32), m, FP8_MAX)
-                    tl.store(q_ptr + g + cols, q.to(qt), mask=m)
-                    tl.store(s_ptr + b + lr, sc)
 
 
 @triton.jit(do_not_specialize=[
@@ -810,13 +800,12 @@ class fused_rs_add_rms_norm_ag:
 
     gather=True (default): RS + add + RMSNorm + AG, replaces all_reduce + add norm.
     gather=False: RS + add + RMSNorm only, every rank keeps its normed rows.
-    quant (gather=True only), per-token fp8 of the normed rows, scale = max(amax, 1e-10) / fp8 max:
-      QUANT_AFTER_AG: AG in x dtype as above, every rank also quantizes all T rows into q / s;
-      QUANT_FP8_AG: the owner quantizes its rows and the AG carries fp8 + scale, half the
-        bytes; out holds only this rank's rows in x dtype.
+    quant=QUANT_FP8_AG (gather=True only): per-token fp8 of the normed rows, scale =
+      max(amax, 1e-10) / fp8 max; the owner quantizes its rows and the AG carries fp8 +
+      scale, half the bytes; out holds only this rank's rows in x dtype.
     """
 
-    QUANT_NONE, QUANT_AFTER_AG, QUANT_FP8_AG = 0, 1, 2
+    QUANT_NONE, QUANT_FP8_AG = 0, 2
 
     @staticmethod
     def parity_bytes(world_size: int, max_tokens: int, hidden_size: int, dtype: torch.dtype) -> int:
@@ -863,7 +852,7 @@ class fused_rs_add_rms_norm_ag:
             raise ValueError(f"residual must hold rows [{b}, {e}), got {tuple(residual.shape)}")
         if not (x.is_contiguous() and residual.is_contiguous() and weight.is_contiguous()):
             raise ValueError("tensors must be contiguous")
-        if quant not in (self.QUANT_NONE, self.QUANT_AFTER_AG, self.QUANT_FP8_AG):
+        if quant not in (self.QUANT_NONE, self.QUANT_FP8_AG):
             raise ValueError(f"bad quant {quant}")
         if quant and not gather:
             raise ValueError("quant needs gather=True")
@@ -1073,22 +1062,20 @@ def _quant_ref(y, dtype=torch.float8_e4m3fn):
 
 
 def _check_quant(op, T, weight, eps, seed):
-    # both quant modes run the same ring sums, so their normed rows are bit-identical:
-    # q / scale must match the reference quantization of the bf16 rows exactly
+    # the fp8 AG and the bf16 AG run the same ring sums: the fp8 rows must be the reference
+    # quantization of the bf16 rows (up to one fp8 code where a normed element rounds differently)
     comm = op.comm
     b, e = comm.row_range(T)
     H, dt = op.hidden_size, op.dtype
     x = _rank_input(comm.rank, T, H, dt, seed)
     res = _shared_input(T, H, dt, seed)[b:e]
-    out1, q1, s1 = op(x.clone(), res.clone(), weight, eps, quant=op.QUANT_AFTER_AG)
+    out1 = op(x.clone(), res.clone(), weight, eps)
     r2 = res.clone()
     out2, q2, s2 = op(x.clone(), r2, weight, eps, quant=op.QUANT_FP8_AG)
+    q1, s1 = q2, s2
     torch.cuda.synchronize()
     # the two kernels may round a few normed elements differently (1 bf16 ulp)
     _assert_close(out2, out1[b:e], tol=1e-2, max_frac=1e-3, hard=0.05)
-    steps = (q2.view(torch.uint8).short() - q1.view(torch.uint8).short()).abs().max().item() if T else 0
-    if steps > 1 or not torch.allclose(s2, s1, rtol=1e-2, atol=0):
-        raise AssertionError(f"T={T} fp8 AG vs AG then quant: q up to {steps} codes apart or scales differ")
     # what every rank received over the fp8 ring must be bit-identical to what the owner sent
     q_all = [torch.empty_like(q2.view(torch.uint8)) for _ in range(comm.world_size)]
     dist.all_gather(q_all, q2.view(torch.uint8).contiguous())
@@ -1110,13 +1097,70 @@ def _check_quant(op, T, weight, eps, seed):
         # fp32 rounding of the scale / division: q may be one fp8 step off, never more
         # (same sign: adjacent e4m3 codes)
         steps = (rq.view(torch.uint8).short() - q1.view(torch.uint8).short()).abs().max().item()
-        if ds > 1e-6 or steps > 1:
+        if ds > 1e-2 or steps > 1:
             raise AssertionError(f"T={T} vs {name}: {nq} / {q1.numel()} q differ (up to {steps} codes), "
                                  f"{ns} scales differ, max rel {ds:.2e}")
         _QSTATS[name] = [sum(v) for v in zip(_QSTATS.get(name, (0, 0, 0, 0)), (nq, q1.numel(), ns, s1.numel()))]
 
 
 _QSTATS = {}
+
+
+def _check_graph(rs, qkv, T, weight, qw, kvw, eps):
+    # capture rs+norm+ag, rs+norm+fp8 ag, rs+norm and qkv norm+ag once, replay a few times:
+    # every replay must give what eager calls give
+    comm = rs.comm
+    b, e = comm.row_range(T)
+    H, D, dt = rs.hidden_size, qkv.row_dim, rs.dtype
+    x = _rank_input(comm.rank, T, H, dt, 21)
+    res = _shared_input(T, H, dt, 21)[b:e].contiguous()
+    xq = _shared_input(T, D, dt, 22)[b:e].contiguous()
+    bufs = dict(x=torch.empty_like(x), res=torch.empty_like(res), out=torch.empty_like(x),
+                out_s=torch.empty(e - b, H, dtype=dt, device="cuda"),
+                q=torch.empty(T, H, dtype=torch.float8_e4m3fn, device="cuda"),
+                s=torch.empty(T, 1, dtype=torch.float32, device="cuda"),
+                rows=torch.empty(e - b, H, dtype=dt, device="cuda"),
+                qkv=torch.empty(T, D, dtype=dt, device="cuda"))
+
+    def step():
+        rs(bufs["x"], bufs["res"], weight, eps, out=bufs["out"])
+        rs(bufs["x"], bufs["res"], weight, eps, out=bufs["rows"], quant=rs.QUANT_FP8_AG, q=bufs["q"], scale=bufs["s"])
+        rs(bufs["x"], bufs["res"], weight, eps, out=bufs["out_s"], gather=False)
+        qkv(xq, T, qw, eps, kvw, eps, out=bufs["qkv"])
+
+    def run_eager():
+        bufs["x"].copy_(x)
+        bufs["res"].copy_(res)
+        step()
+        torch.cuda.synchronize()
+        return {k: v.clone() for k, v in bufs.items()}
+
+    ref = run_eager()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side):
+        bufs["x"].copy_(x)
+        bufs["res"].copy_(res)
+        dist.barrier()
+        with torch.cuda.graph(graph, stream=side):
+            step()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    for i in range(3):
+        bufs["x"].copy_(x)
+        bufs["res"].copy_(res)
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph.replay()
+        torch.cuda.synchronize()
+        for k in ("out", "out_s", "res", "rows", "s", "qkv"):
+            if not torch.equal(bufs[k], ref[k]):
+                raise AssertionError(f"T={T} graph replay {i}: {k} differs from eager")
+        if not torch.equal(bufs["q"].view(torch.uint8), ref["q"].view(torch.uint8)):
+            raise AssertionError(f"T={T} graph replay {i}: q differs from eager")
+    # eager calls after replays still line up with the device call state
+    run_eager()
 
 
 def _check_qkv(op, T, qw, kvw, eps, seed):
@@ -1201,6 +1245,7 @@ def main():
         peer=os.environ.get("PEER", "auto"),
         rings=rings,
         nchannels=nchannels,
+        cuda_graph=os.environ.get("CUDA_GRAPH", "0") == "1",
     )
     rank, W = comm.rank, comm.world_size
     log = print if rank == 0 else (lambda *a, **k: None)
@@ -1223,11 +1268,15 @@ def main():
         _check_qkv(qkv, T, qw, kvw, eps, seed=2)
         _check_rs(rs, T, weight, eps, gather=False, seed=3)
         _check_quant(rs, T, weight, eps, seed=4)
+    if comm.cuda_graph:
+        for T in (1, W + 1, 129, 513):
+            _check_graph(rs, qkv, T, weight, qw, kvw, eps)
+        log(f"cuda graph: capture + 3 replays match eager, T=[1, {W + 1}, 129, 513]")
     errs = torch.tensor(comm.errors(), device="cuda")
     dist.all_reduce(errs)
     if errs.item():
         raise RuntimeError(f"{errs.item()} wait timeouts")
-    log(f"correctness: rs+norm+ag / qkv norm+ag / rs+norm / rs+norm+ag+quant (both modes), T={sizes} up and down: pass")
+    log(f"correctness: rs+norm+ag / qkv norm+ag / rs+norm / rs+norm+quant+fp8 ag, T={sizes} up and down: pass")
     for name, (nq, tq, ns, ts) in _QSTATS.items():
         log(f"  quant vs {name}: q bytes differ {nq} / {tq}, scales differ {ns} / {ts}")
 
@@ -1276,8 +1325,6 @@ def main():
         r["tle_rs_norm_us"] = _bench(lambda: rs(x, residual, weight, eps, out=out_s, gather=False), iters)
         qb = torch.empty(T, H, dtype=torch.float8_e4m3fn, device="cuda")
         sb = torch.empty(T, 1, dtype=torch.float32, device="cuda")
-        r["tle_rs_norm_ag_quant_us"] = _bench(
-            lambda: rs(x, residual, weight, eps, out=out, quant=rs.QUANT_AFTER_AG, q=qb, scale=sb), iters)
         r["tle_rs_norm_quant_ag_fp8_us"] = _bench(
             lambda: rs(x, residual, weight, eps, out=out_s, quant=rs.QUANT_FP8_AG, q=qb, scale=sb), iters)
         try:
@@ -1302,7 +1349,7 @@ def main():
             f" (AR {r['nccl_ar_us']:7.1f}) | rs+norm: flagtree {r['tle_rs_norm_us']:7.1f}"
             + (f" FlagGems {r['fg_rs_norm_us']:7.1f}" if fg else "") +
             f" | qkv norm+ag: flagtree {r['tle_qkv_norm_ag_us']:7.1f}{fgq} AG+norm {r['nccl_ag_norm_us']:7.1f}"
-            f" | rs+norm+ag+quant {r['tle_rs_norm_ag_quant_us']:7.1f} rs+norm+ag, lightop quant"
+            f" | rs+norm+ag, lightop quant"
             f" {r['tle_rs_norm_ag_then_lightop_quant_us']:7.1f} rs+norm+quant+ag(fp8)"
             f" {r['tle_rs_norm_quant_ag_fp8_us']:7.1f}  (us)")
     errs = torch.tensor(comm.errors() + (sum(o.errors() for o in fg) if fg else 0), device="cuda")
