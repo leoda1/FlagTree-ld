@@ -133,6 +133,13 @@ def _remote_store(ptr, value, mask):
     tl.store(ptr, value, mask=mask)
 
 
+@triton.jit
+def _quant_row(y, m, FP8_MAX: tl.constexpr):
+    # per-token fp8: scale = max(amax, 1e-10) / FP8_MAX, same as lightop per_token_quant_fp8
+    s = tl.maximum(tl.max(tl.where(m, tl.abs(y), 0.0)), 1e-10) / FP8_MAX
+    return tl.clamp(y / s, -FP8_MAX, FP8_MAX), s
+
+
 @triton.jit(do_not_specialize=[
     "num_tokens", "chunk", "slot_elems", "parity_elems", "flag_off", "host_parity", "host_base", "rank", "nchan",
     "eps", "max_spin"
@@ -141,7 +148,9 @@ def rs_norm_ag_ring_kernel(
     x_ptr,  # [T, H] partial sums
     res_ptr,  # [rows of this rank, H], updated in place
     w_ptr,  # [H]
-    out_ptr,  # [T, H], may alias x
+    out_ptr,  # [T, H], may alias x; QUANT == 2: [rows of this rank, H]
+    q_ptr,  # QUANT > 0: [T, H] fp8 of the normed rows
+    s_ptr,  # QUANT > 0: [T] fp32 scale of every row of q
     buf_ptr,  # local data slots (start of the shared buffer), x dtype
     flag_ptr,  # local flags, one int32 per program
     peer_ptr,  # int64 [W], every rank's buffer (IPC path)
@@ -165,6 +174,9 @@ def rs_norm_ag_ring_kernel(
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     DO_AG: tl.constexpr,  # False: stop after the norm, out holds only my rows
+    QUANT: tl.constexpr,  # 0: none; 2: quantize my rows, AG fp8 + scale
+    FP8_MAX: tl.constexpr,
+    BLOCK_W: tl.constexpr,  # QUANT == 2: >= H / 4 + 1, the int32 words of a row on the ring
     PEER_PTR: tl.constexpr,
     RECV_LOAD: tl.constexpr,
     REMOTE_STORE: tl.constexpr,
@@ -177,6 +189,7 @@ def rs_norm_ag_ring_kernel(
     cols = tl.arange(0, BLOCK_H)
     m = cols < H
     dt = x_ptr.dtype.element_ty
+    qt = q_ptr.dtype.element_ty
 
     c = pid % nchan
     p = tl.load(pos_ptr + c)
@@ -219,6 +232,14 @@ def rs_norm_ag_ring_kernel(
     mb = tl.minimum(rank * chunk, num_tokens)
     mn = tl.minimum((rank + 1) * chunk, num_tokens) - mb
     w = tl.load(w_ptr + cols, mask=m, other=0.0).to(tl.float32)
+    # QUANT == 2: a row travels as H / 4 int32 words of fp8 codes, then the fp32 scale
+    H4: tl.constexpr = H // 4
+    wc = tl.arange(0, BLOCK_W)
+    q32_ptr = q_ptr.to(tl.pointer_type(tl.int32))
+    s32_ptr = s_ptr.to(tl.pointer_type(tl.int32))
+    mine32 = mine.to(tl.pointer_type(tl.int32))
+    nxt32 = nxt.to(tl.pointer_type(tl.int32))
+    se32 = se // 2
     for lr in range(pid, mn, G):
         row = lr.to(tl.int64) * H
         g = (mb + lr).to(tl.int64) * H
@@ -228,11 +249,22 @@ def rs_norm_ag_ring_kernel(
         rrms = 1 / tl.sqrt(tl.sum(x * x) / H + eps)
         tl.store(res_ptr + row + cols, x.to(dt), mask=m)
         y = (x * rrms * w).to(dt)
-        if DO_AG:
+        if DO_AG and QUANT != 2:
             tl.store(out_ptr + g + cols, y, mask=m)
             REMOTE_STORE(nxt + (WORLD - 1) * se + row + cols, y, mask=m)
         else:
             tl.store(out_ptr + row + cols, y, mask=m)
+        if QUANT == 2:
+            q, sc = _quant_row(y.to(tl.float32), m, FP8_MAX)
+            # pack 4 fp8 codes per int32 (disjoint bits: the sum is an OR)
+            c4 = tl.reshape(q.to(qt).to(tl.uint8, bitcast=True).to(tl.int32), (BLOCK_H // 4, 4))
+            words = tl.sum(c4 << (tl.arange(0, 4) * 8)[None, :], axis=1)
+            wm = tl.arange(0, BLOCK_H // 4) < H4
+            r32 = lr.to(tl.int64) * (H4 + 1)
+            tl.store(q32_ptr + (mb + lr).to(tl.int64) * H4 + tl.arange(0, BLOCK_H // 4), words, mask=wm)
+            tl.store(s_ptr + mb + lr, sc)
+            REMOTE_STORE(nxt32 + (WORLD - 1) * se32 + r32 + tl.arange(0, BLOCK_H // 4), words, mask=wm)
+            REMOTE_STORE(nxt32 + (WORLD - 1) * se32 + r32 + H4, sc.to(tl.int32, bitcast=True), mask=True)
 
     if DO_AG:
         SIGNAL(succ_flag, base + WORLD)
@@ -242,17 +274,27 @@ def rs_norm_ag_ring_kernel(
             k = tl.load(ring + (p + WORLD - t) % WORLD)
             b = tl.minimum(k * chunk, num_tokens)
             n = tl.minimum((k + 1) * chunk, num_tokens) - b
-            for lr in range(pid, n, G):
-                row = lr.to(tl.int64) * H
-                v = RECV_LOAD(mine + (WORLD - 2 + t) * se + row + cols, mask=m)
-                tl.store(out_ptr + (b + lr).to(tl.int64) * H + cols, v, mask=m)
-                if t < WORLD - 1:
-                    REMOTE_STORE(nxt + (WORLD - 1 + t) * se + row + cols, v, mask=m)
+            if QUANT == 2:
+                for lr in range(pid, n, G):
+                    r32 = lr.to(tl.int64) * (H4 + 1)
+                    v = RECV_LOAD(mine32 + (WORLD - 2 + t) * se32 + r32 + wc, mask=wc <= H4)
+                    tl.store(q32_ptr + (b + lr).to(tl.int64) * H4 + wc, v, mask=wc < H4)
+                    tl.store(s32_ptr + (b + lr) + wc * 0, v, mask=wc == H4)
+                    if t < WORLD - 1:
+                        REMOTE_STORE(nxt32 + (WORLD - 1 + t) * se32 + r32 + wc, v, mask=wc <= H4)
+            else:
+                for lr in range(pid, n, G):
+                    row = lr.to(tl.int64) * H
+                    v = RECV_LOAD(mine + (WORLD - 2 + t) * se + row + cols, mask=m)
+                    tl.store(out_ptr + (b + lr).to(tl.int64) * H + cols, v, mask=m)
+                    if t < WORLD - 1:
+                        REMOTE_STORE(nxt + (WORLD - 1 + t) * se + row + cols, v, mask=m)
             if t < WORLD - 1:
                 SIGNAL(succ_flag, base + WORLD + t)
         _epoch_end(call_state_ptr, seq, base, 2 * WORLD - 2, DEVICE_EPOCH)
     else:
         _epoch_end(call_state_ptr, seq, base, WORLD - 1, DEVICE_EPOCH)
+
 
 
 @triton.jit(do_not_specialize=[
@@ -462,8 +504,37 @@ class _Platform:
     def num_warps(self, block):
         return min(16, max(4, block // 256))
 
+    def kernel(self, fn):
+        """The jit function to launch, wrapped if the platform needs compile settings."""
+        return fn
+
     def kernel_args(self):
         return dict(RECV_LOAD=self.recv_load, REMOTE_STORE=self.remote_store, SIGNAL=self.signal, WAIT=self.wait)
+
+
+class _EnvScopedKernel:
+    """kernel[grid](...) with one env var set while it launches (and compiles), restored after.
+    The env var, unlike triton.knobs, enters the disk cache key, so a binary built without
+    the setting is never reused."""
+
+    def __init__(self, fn, key, value):
+        self.fn, self.key, self.value = fn, key, value
+
+    def __getitem__(self, grid):
+        launch = self.fn[grid]
+
+        def run(*args, **kwargs):
+            old = os.environ.get(self.key)
+            os.environ[self.key] = self.value
+            try:
+                return launch(*args, **kwargs)
+            finally:
+                if old is None:
+                    del os.environ[self.key]
+                else:
+                    os.environ[self.key] = old
+
+        return run
 
 
 class PpuPlatform(_Platform):
@@ -487,6 +558,12 @@ class HcuPlatform(_Platform):
     def allocate(self, ptr, size):
         # hipDeviceMallocUncached: coarse-grained hipMalloc breaks peer flag visibility.
         return self.fn("ExtMallocWithFlags")(ptr, size, ctypes.c_uint(3))
+
+    def kernel(self, fn):
+        # Buffer ops break these kernels on the AMD backend: FlagTree fails to build them
+        # (HSACO: llvm.amdgcn.make.buffer.rsrc gets the wrong pointer type) and stock Triton
+        # 3.5 builds them 20% slower (1682 us vs 1392 us at 8192 tokens on BW1101).
+        return _EnvScopedKernel(fn, "AMDGCN_USE_BUFFER_OPS", "0")
 
 
 class MetaxPlatform(_Platform):
@@ -723,7 +800,12 @@ class fused_rs_add_rms_norm_ag:
 
     gather=True (default): RS + add + RMSNorm + AG, replaces all_reduce + add norm.
     gather=False: RS + add + RMSNorm only, every rank keeps its normed rows.
+    quant=QUANT_FP8_AG (gather=True only): per-token fp8 of the normed rows, scale =
+      max(amax, 1e-10) / fp8 max; the owner quantizes its rows and the AG carries fp8 +
+      scale, half the bytes; out holds only this rank's rows in x dtype.
     """
+
+    QUANT_NONE, QUANT_FP8_AG = 0, 2
 
     @staticmethod
     def parity_bytes(world_size: int, max_tokens: int, hidden_size: int, dtype: torch.dtype) -> int:
@@ -748,11 +830,16 @@ class fused_rs_add_rms_norm_ag:
         eps: float,
         out: Optional[torch.Tensor] = None,
         gather: bool = True,
-    ) -> torch.Tensor:
+        quant: int = 0,
+        q: Optional[torch.Tensor] = None,
+        scale: Optional[torch.Tensor] = None,
+        quant_dtype: torch.dtype = torch.float8_e4m3fn,
+    ):
         """x: [T, H] partial sums, residual: this rank's rows (updated in place).
         gather=True: returns the normed full [T, H], written into x unless `out` is given.
         gather=False: returns the normed rows of this rank [e - b, H], written into
-        x[b:e] unless `out` is given."""
+        x[b:e] unless `out` is given.
+        quant > 0: returns (out, q [T, H], scale [T, 1]); QUANT_FP8_AG: out is [e - b, H]."""
         comm = self.comm
         T, H = x.shape
         W = comm.world_size
@@ -765,22 +852,40 @@ class fused_rs_add_rms_norm_ag:
             raise ValueError(f"residual must hold rows [{b}, {e}), got {tuple(residual.shape)}")
         if not (x.is_contiguous() and residual.is_contiguous() and weight.is_contiguous()):
             raise ValueError("tensors must be contiguous")
+        if quant not in (self.QUANT_NONE, self.QUANT_FP8_AG):
+            raise ValueError(f"bad quant {quant}")
+        if quant and not gather:
+            raise ValueError("quant needs gather=True")
+        if quant == self.QUANT_FP8_AG and (x.element_size() != 2 or H % 4):
+            # a row of H / 4 + 1 int32 words fits in the H 16-bit elements of a slot row
+            raise ValueError("fp8 AG needs a 16-bit x and H % 4 == 0")
+        full = gather and quant != self.QUANT_FP8_AG
         if out is None:
-            out = x if gather else x[b:e]
-        elif tuple(out.shape) != ((T, H) if gather else (e - b, H)) or not out.is_contiguous():
+            out = x if full else x[b:e]
+        elif tuple(out.shape) != ((T, H) if full else (e - b, H)) or not out.is_contiguous():
             raise ValueError(f"bad out shape {tuple(out.shape)}")
+        if quant:
+            if q is None:
+                q = torch.empty((T, H), dtype=quant_dtype, device=x.device)
+            if scale is None:
+                scale = torch.empty((T, 1), dtype=torch.float32, device=x.device)
+            if (tuple(q.shape) != (T, H) or tuple(scale.shape) != (T, 1) or scale.dtype != torch.float32
+                    or not (q.is_contiguous() and scale.is_contiguous())):
+                raise ValueError("q must be a contiguous [T, H], scale a contiguous fp32 [T, 1]")
         if T == 0:
-            return out
+            return (out, q, scale) if quant else out
 
         # RS + AG: 2W - 2 signals; RS only: the W - 1 RS hops
         epoch = comm.call_args(2 * W - 2 if gather else W - 1)
         nchan, grid = comm.launch_shape(T)
         BLOCK_H = triton.next_power_of_2(H)
-        rs_norm_ag_ring_kernel[(grid, )](
+        comm.platform.kernel(rs_norm_ag_ring_kernel)[(grid, )](
             x,
             residual if residual.numel() else x,
             weight,
             out if out.numel() else x,
+            q if quant else x,
+            scale if quant else x,
             self.data,
             comm.flags,
             comm.peers,
@@ -800,11 +905,14 @@ class fused_rs_add_rms_norm_ag:
             H=H,
             BLOCK_H=BLOCK_H,
             DO_AG=gather,
+            QUANT=quant,
+            FP8_MAX=torch.finfo(q.dtype).max if quant else 1.0,
+            BLOCK_W=triton.next_power_of_2(H // 4 + 1),
             num_warps=comm.platform.num_warps(BLOCK_H),
             **epoch,
             **comm.launch_args(),
         )
-        return out
+        return (out, q, scale) if quant else out
 
 
 class fused_qkv_norm_ag:
@@ -867,7 +975,7 @@ class fused_qkv_norm_ag:
         epoch = comm.call_args(W - 1)
         nchan, grid = comm.launch_shape(T)
         BLOCK = triton.next_power_of_2(D)
-        qkv_norm_ag_ring_kernel[(grid, )](
+        comm.platform.kernel(qkv_norm_ag_ring_kernel)[(grid, )](
             x if x.numel() else out,
             q_weight,
             kv_weight,
@@ -945,6 +1053,114 @@ def _check_rs(op, T, weight, eps, gather, seed):
     torch.cuda.synchronize()
     _assert_close(out, ref_out if gather else ref_out[b:e])
     _assert_close(residual, ref_res)
+
+
+def _quant_ref(y, dtype=torch.float8_e4m3fn):
+    fmax = torch.finfo(dtype).max
+    s = y.float().abs().amax(-1, keepdim=True).clamp_min(1e-10) / fmax
+    return (y.float() / s).clamp(-fmax, fmax).to(dtype), s
+
+
+def _check_quant(op, T, weight, eps, seed):
+    # the fp8 AG and the bf16 AG run the same ring sums: the fp8 rows must be the reference
+    # quantization of the bf16 rows (up to one fp8 code where a normed element rounds differently)
+    comm = op.comm
+    b, e = comm.row_range(T)
+    H, dt = op.hidden_size, op.dtype
+    x = _rank_input(comm.rank, T, H, dt, seed)
+    res = _shared_input(T, H, dt, seed)[b:e]
+    out1 = op(x.clone(), res.clone(), weight, eps)
+    r2 = res.clone()
+    out2, q2, s2 = op(x.clone(), r2, weight, eps, quant=op.QUANT_FP8_AG)
+    q1, s1 = q2, s2
+    torch.cuda.synchronize()
+    # the two kernels may round a few normed elements differently (1 bf16 ulp)
+    _assert_close(out2, out1[b:e], tol=1e-2, max_frac=1e-3, hard=0.05)
+    # what every rank received over the fp8 ring must be bit-identical to what the owner sent
+    q_all = [torch.empty_like(q2.view(torch.uint8)) for _ in range(comm.world_size)]
+    dist.all_gather(q_all, q2.view(torch.uint8).contiguous())
+    s_all = [torch.empty_like(s2) for _ in range(comm.world_size)]
+    dist.all_gather(s_all, s2.contiguous())
+    if not all(torch.equal(a, q_all[0]) for a in q_all) or not all(torch.equal(a, s_all[0]) for a in s_all):
+        raise AssertionError(f"T={T} fp8 AG: ranks hold different q / scale")
+    refs = [("torch", *_quant_ref(out1))]
+    try:  # the vendor kernel the MoE layers use on Hygon
+        from lightop._lmslim_native.layers.gemm.fp8_utils import per_token_quant_fp8
+        refs.append(("lightop", *per_token_quant_fp8(out1)))
+    except ImportError:
+        pass
+    torch.cuda.synchronize()
+    for name, rq, rs in refs:
+        nq = (rq.view(torch.uint8) != q1.view(torch.uint8)).sum().item()
+        ns = (rs != s1).sum().item()
+        ds = ((rs - s1).abs() / rs).max().item()
+        # fp32 rounding of the scale / division: q may be one fp8 step off, never more
+        # (same sign: adjacent e4m3 codes)
+        steps = (rq.view(torch.uint8).short() - q1.view(torch.uint8).short()).abs().max().item()
+        if ds > 1e-2 or steps > 1:
+            raise AssertionError(f"T={T} vs {name}: {nq} / {q1.numel()} q differ (up to {steps} codes), "
+                                 f"{ns} scales differ, max rel {ds:.2e}")
+        _QSTATS[name] = [sum(v) for v in zip(_QSTATS.get(name, (0, 0, 0, 0)), (nq, q1.numel(), ns, s1.numel()))]
+
+
+_QSTATS = {}
+
+
+def _check_graph(rs, qkv, T, weight, qw, kvw, eps):
+    # capture rs+norm+ag, rs+norm+fp8 ag, rs+norm and qkv norm+ag once, replay a few times:
+    # every replay must give what eager calls give
+    comm = rs.comm
+    b, e = comm.row_range(T)
+    H, D, dt = rs.hidden_size, qkv.row_dim, rs.dtype
+    x = _rank_input(comm.rank, T, H, dt, 21)
+    res = _shared_input(T, H, dt, 21)[b:e].contiguous()
+    xq = _shared_input(T, D, dt, 22)[b:e].contiguous()
+    bufs = dict(x=torch.empty_like(x), res=torch.empty_like(res), out=torch.empty_like(x),
+                out_s=torch.empty(e - b, H, dtype=dt, device="cuda"),
+                q=torch.empty(T, H, dtype=torch.float8_e4m3fn, device="cuda"),
+                s=torch.empty(T, 1, dtype=torch.float32, device="cuda"),
+                rows=torch.empty(e - b, H, dtype=dt, device="cuda"),
+                qkv=torch.empty(T, D, dtype=dt, device="cuda"))
+
+    def step():
+        rs(bufs["x"], bufs["res"], weight, eps, out=bufs["out"])
+        rs(bufs["x"], bufs["res"], weight, eps, out=bufs["rows"], quant=rs.QUANT_FP8_AG, q=bufs["q"], scale=bufs["s"])
+        rs(bufs["x"], bufs["res"], weight, eps, out=bufs["out_s"], gather=False)
+        qkv(xq, T, qw, eps, kvw, eps, out=bufs["qkv"])
+
+    def run_eager():
+        bufs["x"].copy_(x)
+        bufs["res"].copy_(res)
+        step()
+        torch.cuda.synchronize()
+        return {k: v.clone() for k, v in bufs.items()}
+
+    ref = run_eager()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side):
+        bufs["x"].copy_(x)
+        bufs["res"].copy_(res)
+        dist.barrier()
+        with torch.cuda.graph(graph, stream=side):
+            step()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    for i in range(3):
+        bufs["x"].copy_(x)
+        bufs["res"].copy_(res)
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph.replay()
+        torch.cuda.synchronize()
+        for k in ("out", "out_s", "res", "rows", "s", "qkv"):
+            if not torch.equal(bufs[k], ref[k]):
+                raise AssertionError(f"T={T} graph replay {i}: {k} differs from eager")
+        if not torch.equal(bufs["q"].view(torch.uint8), ref["q"].view(torch.uint8)):
+            raise AssertionError(f"T={T} graph replay {i}: q differs from eager")
+    # eager calls after replays still line up with the device call state
+    run_eager()
 
 
 def _check_qkv(op, T, qw, kvw, eps, seed):
@@ -1029,6 +1245,7 @@ def main():
         peer=os.environ.get("PEER", "auto"),
         rings=rings,
         nchannels=nchannels,
+        cuda_graph=os.environ.get("CUDA_GRAPH", "0") == "1",
     )
     rank, W = comm.rank, comm.world_size
     log = print if rank == 0 else (lambda *a, **k: None)
@@ -1050,11 +1267,18 @@ def main():
         _check_rs(rs, T, weight, eps, gather=True, seed=1)
         _check_qkv(qkv, T, qw, kvw, eps, seed=2)
         _check_rs(rs, T, weight, eps, gather=False, seed=3)
+        _check_quant(rs, T, weight, eps, seed=4)
+    if comm.cuda_graph:
+        for T in (1, W + 1, 129, 513):
+            _check_graph(rs, qkv, T, weight, qw, kvw, eps)
+        log(f"cuda graph: capture + 3 replays match eager, T=[1, {W + 1}, 129, 513]")
     errs = torch.tensor(comm.errors(), device="cuda")
     dist.all_reduce(errs)
     if errs.item():
         raise RuntimeError(f"{errs.item()} wait timeouts")
-    log(f"correctness: rs+norm+ag / qkv norm+ag / rs+norm, T={sizes} up and down: pass")
+    log(f"correctness: rs+norm+ag / qkv norm+ag / rs+norm / rs+norm+quant+fp8 ag, T={sizes} up and down: pass")
+    for name, (nq, tq, ns, ts) in _QSTATS.items():
+        log(f"  quant vs {name}: q bytes differ {nq} / {tq}, scales differ {ns} / {ts}")
 
     fg = None
     fg_path = os.environ.get("COMPARE_FLAGGEMS")
@@ -1099,6 +1323,16 @@ def main():
         r = {"T": T}
         r["tle_rs_norm_ag_us"] = _bench(lambda: rs(x, residual, weight, eps, out=out), iters)
         r["tle_rs_norm_us"] = _bench(lambda: rs(x, residual, weight, eps, out=out_s, gather=False), iters)
+        qb = torch.empty(T, H, dtype=torch.float8_e4m3fn, device="cuda")
+        sb = torch.empty(T, 1, dtype=torch.float32, device="cuda")
+        r["tle_rs_norm_quant_ag_fp8_us"] = _bench(
+            lambda: rs(x, residual, weight, eps, out=out_s, quant=rs.QUANT_FP8_AG, q=qb, scale=sb), iters)
+        try:
+            from lightop._lmslim_native.layers.gemm.fp8_utils import per_token_quant_fp8
+            r["tle_rs_norm_ag_then_lightop_quant_us"] = _bench(
+                lambda: per_token_quant_fp8(rs(x, residual, weight, eps, out=out)), iters)
+        except ImportError:
+            r["tle_rs_norm_ag_then_lightop_quant_us"] = float("nan")
         r["tle_qkv_norm_ag_us"] = _bench(lambda: qkv(xq, T, qw, eps, kvw, eps, out=qkv_out), iters)
         r["nccl_ar_us"] = _bench(lambda: dist.all_reduce(xt), iters)
         r["nccl_ar_norm_us"] = _bench(nccl_ar_norm, iters)
@@ -1114,7 +1348,10 @@ def main():
         log(f"T={T:5d} | rs+norm+ag: flagtree {r['tle_rs_norm_ag_us']:7.1f}{fgs} AR+norm {r['nccl_ar_norm_us']:7.1f}"
             f" (AR {r['nccl_ar_us']:7.1f}) | rs+norm: flagtree {r['tle_rs_norm_us']:7.1f}"
             + (f" FlagGems {r['fg_rs_norm_us']:7.1f}" if fg else "") +
-            f" | qkv norm+ag: flagtree {r['tle_qkv_norm_ag_us']:7.1f}{fgq} AG+norm {r['nccl_ag_norm_us']:7.1f}  (us)")
+            f" | qkv norm+ag: flagtree {r['tle_qkv_norm_ag_us']:7.1f}{fgq} AG+norm {r['nccl_ag_norm_us']:7.1f}"
+            f" | rs+norm+ag, lightop quant"
+            f" {r['tle_rs_norm_ag_then_lightop_quant_us']:7.1f} rs+norm+quant+ag(fp8)"
+            f" {r['tle_rs_norm_quant_ag_fp8_us']:7.1f}  (us)")
     errs = torch.tensor(comm.errors() + (sum(o.errors() for o in fg) if fg else 0), device="cuda")
     dist.all_reduce(errs)
     if errs.item():
